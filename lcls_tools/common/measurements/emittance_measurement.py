@@ -12,7 +12,7 @@ from pydantic import (
     PositiveFloat,
 )
 
-from lcls_tools.common.data.emittance import compute_emit_bmag
+from lcls_tools.common.data.emittance import compute_emit_bmag, normalize_emittance
 from lcls_tools.common.data.model_general_calcs import (
     get_rmat_after_magnet,
     quad_scan_optics,
@@ -85,9 +85,12 @@ class EmittanceMeasurementResult(lcls_tools.common.BaseModel):
     quadrupole_pv_values: List[NDArrayAnnotatedType]
     emittance: NDArrayAnnotatedType
     bmag: Optional[List[NDArrayAnnotatedType]] = None
-    twiss_at_screen: List[NDArrayAnnotatedType]
-    rms_beamsizes: List[NDArrayAnnotatedType]
     beam_matrix: NDArrayAnnotatedType
+    twiss_at_screen: List[NDArrayAnnotatedType]
+    rms_beamsizes: NDArrayAnnotatedType
+    rmats: NDArrayAnnotatedType
+    design_twiss: NDArrayAnnotatedType
+    energy: float
     metadata: SerializeAsAny[Any]
 
     def get_best_bmag(self, mode=BMAGMode.GEOMETRIC_MEAN) -> tuple:
@@ -398,6 +401,90 @@ class MultiDeviceEmittance(Measurement):
 
     def measure(self):
         raise NotImplementedError("Multi-device emittance not yet implemented")
+
+
+def redo_point_quad_scan(
+    emittance_result: EmittanceMeasurementResult,
+    magnet: Magnet,
+    beamsize_measurement: BeamProfileMeasurement,
+    redo_index,
+    physics_model: Literal["BMAD", "BLEM", "Lucretia"] = "BLEM",
+):
+    """Redo measurement for some value in quad scan"""
+    magnet.set_bdes_with_validation(emittance_result.quadrupole_pv_values[redo_index])
+    optics = quad_scan_optics(magnet, beamsize_measurement, physics_model)
+    rmat = optics["rmat"]
+    result = beamsize_measurement.measure()
+
+    beam_sizes = emittance_result.rms_beamsizes
+    beam_sizes[:, redo_index] = result.rms_sizes
+    beamsizes_squared = (beam_sizes * 1e-3) ** 2  #  units of mm^2
+    beamsizes_squared = np.expand_dims(
+        beamsizes_squared, -1
+    )  # makes shape 2 x n x 1 for compute_emit_bmag
+
+    rmat = np.array([rmat[0:2, 0:2], rmat[2:4, 2:4]])
+    rmats = emittance_result.rmats
+    rmats[:, redo_index, :, :] = rmat
+
+    emittance_dict = compute_emit_bmag(
+        beamsizes_squared, rmats, emittance_result.design_twiss
+    )
+    emittance_dict["emittance"] = normalize_emittance(
+        emittance_dict["emittance"], emittance_result.energy
+    )
+
+    new_emittance_result = emittance_result.model_copy(
+        update={
+            "emittance": emittance_dict["emittance"],
+            "bmag": emittance_dict["bmag"],
+            "beam_matrix": emittance_dict["beam_matrix"],
+            "twiss_at_screen": emittance_dict["twiss_at_screen"],
+            "rms_beamsizes": beam_sizes,
+            "rmats": rmats,
+        },
+        deep=True,
+    )
+
+    return new_emittance_result
+
+
+def redo_point_multi(
+    emittance_result: EmittanceMeasurementResult,
+    beamsize_measurements: List[BeamProfileMeasurement],
+    redo_index,
+    physics_model: Literal["BMAD", "BLEM", "Lucretia"] = "BLEM",
+):
+    """Redo measurement for some value in multi device measurement"""
+    beamsize_measurement = beamsize_measurements[redo_index]
+    result = beamsize_measurement.measure()
+
+    beam_sizes = emittance_result.rms_beamsizes
+    beam_sizes[:, redo_index] = result.rms_sizes
+    beamsizes_squared = (beam_sizes * 1e-3) ** 2  #  units of mm^2
+    beamsizes_squared = np.expand_dims(
+        beamsizes_squared, -1
+    )  # makes shape 2 x n x 1 for compute_emit_bmag
+
+    emittance_dict = compute_emit_bmag(
+        beamsizes_squared, emittance_result.rmats, emittance_result.design_twiss
+    )
+    emittance_dict["emittance"] = normalize_emittance(
+        emittance_dict["emittance"], emittance_result.energy
+    )
+
+    new_emittance_result = emittance_result.model_copy(
+        update={
+            "emittance": emittance_dict["emittance"],
+            "bmag": emittance_dict["bmag"],
+            "beam_matrix": emittance_dict["beam_matrix"],
+            "twiss_at_screen": emittance_dict["twiss_at_screen"],
+            "rms_beamsizes": beam_sizes,
+        },
+        deep=True,
+    )
+
+    return new_emittance_result
 
 
 def compute_emit_bmag_quad_scan(
